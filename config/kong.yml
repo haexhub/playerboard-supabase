@@ -1,0 +1,154 @@
+_format_version: "2.1"
+_transform: true
+
+###
+### Consumers / API Keys
+###
+consumers:
+  - username: anon
+    keyauth_credentials:
+      - key: ${SUPABASE_ANON_KEY}
+  - username: service_role
+    keyauth_credentials:
+      - key: ${SUPABASE_SERVICE_KEY}
+
+###
+### Access Control Lists
+###
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: admin
+
+###
+### API Routes
+###
+services:
+  ## ==========================================================================
+  ## AUTH (GoTrue)
+  ## ==========================================================================
+  - name: auth-v1
+    url: http://auth:9999/verify
+    routes:
+      - name: auth-v1-verify
+        strip_path: true
+        paths:
+          - /auth/v1/verify
+    plugins:
+      - name: cors
+
+  - name: auth-v1-all
+    url: http://auth:9999
+    routes:
+      - name: auth-v1-all
+        strip_path: true
+        paths:
+          - /auth/v1/
+    plugins:
+      - name: cors
+
+  ## ==========================================================================
+  ## REST (PostgREST)
+  ## ==========================================================================
+  - name: rest-v1
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## ==========================================================================
+  ## GRAPHQL (via PostgREST)
+  ## ==========================================================================
+  - name: graphql-v1
+    url: http://rest:3000/rpc/graphql
+    routes:
+      - name: graphql-v1
+        strip_path: true
+        paths:
+          - /graphql/v1
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## ==========================================================================
+  ## REALTIME (WebSockets) - Multi-tenant v2.x
+  ## ==========================================================================
+  # WebSocket route - hostname-based tenant routing.
+  # Must match docker-compose.yml's realtime container_name/hostname
+  # (${REALTIME_TENANT_NAME:-playerboard}.playerboard-supabase-realtime) —
+  # Kong's declarative config is not templated by REALTIME_TENANT_NAME.
+  - name: realtime-v1-ws
+    url: http://playerboard.playerboard-supabase-realtime:4000/socket/websocket
+    routes:
+      - name: realtime-v1-ws
+        strip_path: true
+        paths:
+          - /realtime/v1/websocket
+    plugins:
+      - name: cors
+
+  # REST API route
+  - name: realtime-v1
+    url: http://playerboard.playerboard-supabase-realtime:4000/socket
+    routes:
+      - name: realtime-v1
+        strip_path: true
+        paths:
+          - /realtime/v1/
+    plugins:
+      - name: cors
+
+  ## ==========================================================================
+  ## STORAGE
+  ## ==========================================================================
+  - name: storage-v1
+    url: http://storage:5000
+    routes:
+      - name: storage-v1
+        strip_path: true
+        paths:
+          - /storage/v1/
+    plugins:
+      - name: cors
+
+  ## ==========================================================================
+  ## POSTGRES META (for Studio)
+  ## ==========================================================================
+  - name: meta
+    url: http://meta:8080/
+    routes:
+      - name: meta
+        strip_path: true
+        paths:
+          - /pg/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin

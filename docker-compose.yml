@@ -1,0 +1,334 @@
+# =============================================================================
+# SUPABASE SELF-HOSTED - playerboard instance
+# =============================================================================
+# Based on: https://github.com/supabase/supabase/blob/master/docker/docker-compose.yml
+# Adapted for Traefik reverse proxy - Supabase for playerboard.de
+
+services:
+  # ===========================================================================
+  # POSTGRESQL DATABASE
+  # ===========================================================================
+  db:
+    image: ${POSTGRES_IMAGE:-supabase/postgres:latest}
+    container_name: playerboard-supabase-db
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      POSTGRES_USER: ${POSTGRES_USER:-supabase_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      PGPORT: ${POSTGRES_PORT:-5432}
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY:-3600}
+    volumes:
+      - playerboard-supabase-db-data:/var/lib/postgresql/data
+      - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:Z
+      - ./volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:Z
+      - ./volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:Z
+    healthcheck:
+      test: pg_isready -U ${POSTGRES_USER:-supabase_admin} -h localhost
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  # ===========================================================================
+  # KONG API GATEWAY
+  # ===========================================================================
+  kong:
+    image: ${KONG_IMAGE:-kong:2.8.1}
+    container_name: playerboard-supabase-kong
+    restart: unless-stopped
+    # Custom entrypoint to substitute environment variables in kong.yml using sed
+    entrypoint: bash -c 'sed "s|\$${SUPABASE_ANON_KEY}|$$SUPABASE_ANON_KEY|g; s|\$${SUPABASE_SERVICE_KEY}|$$SUPABASE_SERVICE_KEY|g" /home/kong/temp.yml > /home/kong/kong.yml && /docker-entrypoint.sh kong docker-start'
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    volumes:
+      - ./config/kong.yml:/home/kong/temp.yml:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      # HTTP Router
+      - "traefik.http.routers.playerboard-supabase.entrypoints=${TRAEFIK_ENDPOINT_HTTP_NAME:-web}"
+      - "traefik.http.routers.playerboard-supabase.rule=Host(`${DOMAIN}`)"
+      # HTTPS Router
+      - "traefik.http.routers.playerboard-supabase_secure.entrypoints=${TRAEFIK_ENDPOINT_HTTPS_NAME:-web_secure}"
+      - "traefik.http.routers.playerboard-supabase_secure.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.playerboard-supabase_secure.tls=true"
+      - "traefik.http.routers.playerboard-supabase_secure.tls.certresolver=${TRAEFIK_LETS_ENCRYPT_RESOLVER:-http_resolver}"
+      # Service
+      - "traefik.http.services.playerboard-supabase.loadbalancer.server.port=8000"
+      # Watchtower
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ===========================================================================
+  # GOTRUE (AUTHENTICATION)
+  # ===========================================================================
+  auth:
+    image: ${GOTRUE_IMAGE:-supabase/gotrue:latest}
+    container_name: playerboard-supabase-auth
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://${POSTGRES_USER:-supabase_admin}:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}?search_path=auth
+      GOTRUE_SITE_URL: ${SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS:-}
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: true
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: false
+      GOTRUE_MAILER_AUTOCONFIRM: ${MAILER_AUTOCONFIRM:-false}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-}
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-587}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS:-}
+      GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-}
+      GOTRUE_MAILER_URLPATHS_INVITE: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_RECOVERY: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /auth/v1/verify
+      GOTRUE_RATE_LIMIT_HEADER: X-Forwarded-For
+      # Turnstile Captcha
+      GOTRUE_SECURITY_CAPTCHA_ENABLED: ${CAPTCHA_ENABLED:-false}
+      GOTRUE_SECURITY_CAPTCHA_PROVIDER: turnstile
+      GOTRUE_SECURITY_CAPTCHA_SECRET: ${CAPTCHA_SECRET:-}
+    networks:
+      - internal
+
+  # ===========================================================================
+  # POSTGREST (REST API)
+  # ===========================================================================
+  rest:
+    image: ${POSTGREST_IMAGE:-postgrest/postgrest:latest}
+    container_name: playerboard-supabase-rest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://${POSTGRES_USER:-supabase_admin}:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      PGRST_DB_SCHEMAS: public,storage,graphql_public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY:-3600}
+    networks:
+      - internal
+
+  # ===========================================================================
+  # REALTIME (WEBSOCKETS)
+  # ===========================================================================
+  realtime:
+    image: ${REALTIME_IMAGE:-supabase/realtime:latest}
+    # Container name must include tenant prefix for multi-tenant routing.
+    # Must stay in sync with the hostname config/kong.yml routes to —
+    # Kong's declarative config isn't templated by REALTIME_TENANT_NAME.
+    container_name: ${REALTIME_TENANT_NAME:-playerboard}.playerboard-supabase-realtime
+    hostname: ${REALTIME_TENANT_NAME:-playerboard}.playerboard-supabase-realtime
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      DB_HOST: db
+      DB_PORT: ${POSTGRES_PORT:-5432}
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB:-postgres}
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: ${VAULT_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${REALTIME_SECRET_KEY_BASE}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      SELF_HOST_TENANT_NAME: ${REALTIME_TENANT_NAME:-playerboard}
+      RLS_POLL_INTERVAL: "60"
+    networks:
+      - internal
+
+  # ===========================================================================
+  # STORAGE API
+  # ===========================================================================
+  storage:
+    image: ${STORAGE_IMAGE:-supabase/storage-api:latest}
+    container_name: playerboard-supabase-storage
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      POSTGREST_URL: http://rest:3000
+      DATABASE_URL: postgres://${POSTGRES_USER:-supabase_admin}:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-file}
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      GLOBAL_S3_BUCKET: stub
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+      IMGPROXY_URL: http://imgproxy:8080
+      # Public URL for signed URL generation (required for self-hosted)
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+    volumes:
+      - playerboard-supabase-storage-data:/var/lib/storage
+    networks:
+      - internal
+
+  # ===========================================================================
+  # IMAGE PROXY (for image transformations)
+  # ===========================================================================
+  imgproxy:
+    image: darthsim/imgproxy:v3.8.0
+    container_name: playerboard-supabase-imgproxy
+    restart: unless-stopped
+    environment:
+      IMGPROXY_BIND: ":8080"
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
+      IMGPROXY_USE_ETAG: "true"
+      IMGPROXY_ENABLE_WEBP_DETECTION: "true"
+    volumes:
+      - playerboard-supabase-storage-data:/var/lib/storage:ro
+    networks:
+      - internal
+
+  # ===========================================================================
+  # POSTGRES META (for Studio)
+  # ===========================================================================
+  meta:
+    image: ${META_IMAGE:-supabase/postgres-meta:latest}
+    container_name: playerboard-supabase-meta
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: db
+      PG_META_DB_PORT: ${POSTGRES_PORT:-5432}
+      PG_META_DB_NAME: ${POSTGRES_DB:-postgres}
+      PG_META_DB_USER: ${POSTGRES_USER:-supabase_admin}
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - internal
+
+  # ===========================================================================
+  # SUPABASE STUDIO (Dashboard)
+  # ===========================================================================
+  studio:
+    image: ${STUDIO_IMAGE:-supabase/studio:latest}
+    container_name: playerboard-supabase-studio
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      meta:
+        condition: service_started
+    environment:
+      HOSTNAME: 0.0.0.0
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DEFAULT_ORGANIZATION_NAME: playerboard
+      DEFAULT_PROJECT_NAME: playerboard
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${API_EXTERNAL_URL}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      LOGFLARE_API_KEY: ${LOGFLARE_API_KEY:-}
+      LOGFLARE_URL: https://api.logflare.app
+      NEXT_PUBLIC_ENABLE_LOGS: "true"
+      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres
+    networks:
+      - proxy
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      # HTTP Router - Redirect to HTTPS
+      - "traefik.http.routers.playerboard-supabase-studio.entrypoints=${TRAEFIK_ENDPOINT_HTTP_NAME:-web}"
+      - "traefik.http.routers.playerboard-supabase-studio.rule=Host(`${STUDIO_DOMAIN}`)"
+      - "traefik.http.routers.playerboard-supabase-studio.middlewares=playerboard-supabase-studio-https-redirect"
+      # HTTPS Redirect Middleware
+      - "traefik.http.middlewares.playerboard-supabase-studio-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.playerboard-supabase-studio-https-redirect.redirectscheme.permanent=true"
+      # HTTPS Router with Basic Auth
+      - "traefik.http.routers.playerboard-supabase-studio_secure.entrypoints=${TRAEFIK_ENDPOINT_HTTPS_NAME:-web_secure}"
+      - "traefik.http.routers.playerboard-supabase-studio_secure.rule=Host(`${STUDIO_DOMAIN}`)"
+      - "traefik.http.routers.playerboard-supabase-studio_secure.tls=true"
+      - "traefik.http.routers.playerboard-supabase-studio_secure.tls.certresolver=${TRAEFIK_LETS_ENCRYPT_RESOLVER:-http_resolver}"
+      - "traefik.http.routers.playerboard-supabase-studio_secure.middlewares=playerboard-supabase-auth"
+      # Basic Auth Middleware
+      - "traefik.http.middlewares.playerboard-supabase-auth.basicauth.users=${DASHBOARD_USERNAME}:${DASHBOARD_PASSWORD_HASH}"
+      # Service
+      - "traefik.http.services.playerboard-supabase-studio.loadbalancer.server.port=3000"
+      # Watchtower
+      - "com.centurylinklabs.watchtower.enable=true"
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  playerboard-supabase-db-data:
+  playerboard-supabase-storage-data:
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  # External: shared with the playerboard app container so Nuxt/Drizzle can
+  # reach Postgres directly (this stack exposes no public DB port). Ansible
+  # creates this network before either compose project starts.
+  internal:
+    name: playerboard-supabase_internal
+    external: true
+  proxy:
+    name: ${TRAEFIK_NETWORK:-proxy}
+    external: true

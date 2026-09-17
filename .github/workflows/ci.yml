@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: docker compose config --quiet
+
+      - name: Check required files exist
+        run: |
+          test -f docker-compose.yml
+          test -f .env.example
+          test -f config/kong.yml
+          test -d volumes/db
+
+      - name: Validate Kong configuration
+        run: |
+          # Check Kong YAML syntax
+          python3 -c "import yaml; yaml.safe_load(open('config/kong.yml'))"
